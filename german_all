@@ -1,0 +1,445 @@
+#今後使うコードの原型
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import warnings
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+warnings.filterwarnings("ignore")
+plt.rcParams["font.sans-serif"] = ["Meiryo", "IPAexGothic", "DejaVu Sans", "Arial", "Helvetica", "Verdana", "sans-serif"]
+plt.rcParams["font.family"] = "sans-serif"
+plt.rcParams["axes.unicode_minus"] = False
+
+# SARIMA パラメータ（必要に応じて調整）
+PARAMS = {
+    "p": 0,"d": 0,"q": 2,
+    "P": 3,"D": 0,"Q": 1,
+    "s": 12,  
+}
+
+# 0 以上であるべき列の接頭辞
+NONNEGATIVE_PREFIXES = ["Total_all_sales", "lag_", "rolling_mean_", "senpai_", "web_", "youtube_", "germany_"]
+
+
+def clip_negative_values(df,include_prefixes = None,include_exact_cols = None):
+    """
+    数値列のうち指定の条件に一致する列の負値を 0 にクリップする。
+    include_prefixes/columns が未指定の場合は全数値列を対象にする。
+    """
+    if df is None or len(df) == 0:
+        return df
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    target_cols = set()
+
+    if include_prefixes:
+        for pfx in include_prefixes:
+            target_cols.update([c for c in numeric_cols if c.startswith(pfx)])
+    if include_exact_cols:
+        target_cols.update([c for c in include_exact_cols if c in numeric_cols])
+    if not include_prefixes and not include_exact_cols:
+        target_cols = set(numeric_cols)
+
+    if target_cols:
+        df.loc[:, list(target_cols)] = df.loc[:, list(target_cols)].clip(lower=0)
+
+    return df
+
+
+def load_toyota_all_data(file_path, start_date_filter = "2020-01-01"): 
+    raw_data = pd.read_csv(file_path, header=None, encoding="shift_jis")
+    models = raw_data.iloc[0].fillna('Unknown')
+    ev_types = raw_data.iloc[1].fillna('Unknown')
+
+    # 先頭2行はメタ情報、3行目以降がデータ
+    data = raw_data.iloc[2:].reset_index(drop=True)
+
+    # 日付列（0列目）を日付に変換（'yy-Mon' 想定）。変換できない場合は NaT
+    date_column = pd.to_datetime(data[0], format="%y-%b", errors="coerce")
+
+    # 数値部（1列目以降）を数値化。'-' と空文字は 0 とみなす（EVコードに合わせる）
+    numeric_data = data.iloc[:, 1:].copy()
+    for col in numeric_data.columns:
+        numeric_data[col] = numeric_data[col].replace(["-", ""], "0")
+        numeric_data[col] = pd.to_numeric(numeric_data[col], errors="coerce").fillna(0)
+
+    # 全車種合計を算出
+    total_sales = numeric_data.sum(axis=1, skipna=True)
+
+    toyota_data = pd.DataFrame({"date": date_column, "Total_all_sales": total_sales})
+    toyota_data = toyota_data.dropna(subset=["date"])
+    toyota_data = toyota_data.set_index("date").sort_index()
+
+    # 非負制約
+    toyota_data = clip_negative_values(toyota_data, include_exact_cols=["Total_all_sales"])
+
+    # 期間フィルタ
+    if start_date_filter:
+        filter_date = pd.to_datetime(start_date_filter)
+        toyota_data = toyota_data[toyota_data.index >= filter_date]
+
+    # 概要表示
+    print(f"\n【トヨタ全車種販売データ統計】")
+    if len(toyota_data) > 0:
+        min_date = toyota_data.index.min().strftime("%Y-%m-%d")
+        max_date = toyota_data.index.max().strftime("%Y-%m-%d")
+        print(f"期間: {min_date} から {max_date}")
+        print(f"平均販売台数: {toyota_data['Total_all_sales'].mean():.0f}台")
+        print(f"最大販売台数: {toyota_data['Total_all_sales'].max():.0f}台")
+        print(f"最小販売台数: {toyota_data['Total_all_sales'].min():.0f}台")
+    else:
+        print("データなし")
+
+    return toyota_data
+
+
+def load_economic_indicator(file_path: str, country: str, encoding: str = "shift_jis") -> pd.DataFrame:
+    """
+    経済指標を読み込み、'yy-Mon' の date で DatetimeIndex 化し、接頭辞を付けて返す。
+    経済指標は負値があり得るため、非負クリップは行わない。
+    """
+    df = pd.read_csv(file_path, encoding=encoding)
+    df.columns = [c.strip() for c in df.columns]
+
+    df["date"] = pd.to_datetime(df["date"], format="%y-%b", errors="coerce")
+    df = df.dropna(subset=["date"]).set_index("date").sort_index()
+
+    df = df.add_prefix(f"{country}_")
+    return df
+
+
+def load_external_factor(file_path: str, prefix: str = "", encoding: str = "utf-8") -> pd.DataFrame:
+    df = pd.read_csv(file_path, encoding=encoding)
+
+    dt = pd.to_datetime(df["date"], errors="coerce")
+    if dt.isna().any():
+        dt2 = pd.to_datetime(df["date"], format="%y-%b", errors="coerce")
+        dt = dt.fillna(dt2)
+    df["date"] = dt
+    df = df.dropna(subset=["date"]).set_index("date").sort_index()
+    if prefix:
+        df = df.add_prefix(f"{prefix}_")
+
+    df = clip_negative_values(df)  # 非負クリップ
+    return df
+
+def preprocess_all_data(all_data: pd.DataFrame, train_start: str, train_end: str) -> pd.DataFrame:
+    for col in all_data.columns:
+        all_data[col] = all_data.groupby(all_data.index.month)[col].transform(lambda x: x.fillna(x.mean()))
+        all_data[col] = all_data[col].fillna(all_data[col].mean())
+
+    all_data = clip_negative_values(all_data, include_prefixes=["Total_all_sales"])
+  
+    return all_data
+
+def add_features(all_data: pd.DataFrame) -> pd.DataFrame:
+    all_data["month"] = all_data.index.month
+
+    # ラグ特徴量
+    for lag in [1, 3, 6, 12]:
+        col_name = f"lag_{lag}"
+        if len(all_data) >= lag:
+            all_data[col_name] = all_data["Total_all_sales"].shift(lag).fillna(all_data["Total_all_sales"].mean())
+        else:
+            all_data[col_name] = all_data["Total_all_sales"].mean()
+
+    # 移動平均特徴量
+    for win in [3, 6, 12]:
+        col_name = f"rolling_mean_{win}"
+        # .shift(1) を追加して $t-1$ 期までの統計量にする
+        all_data[col_name] = all_data["Total_all_sales"].rolling(window=win).mean().shift(1).fillna(all_data["Total_all_sales"].mean())
+
+    # 非負クリップ（lag_ / rolling_）
+    all_data = clip_negative_values(all_data, include_prefixes=["lag_", "rolling_mean_"])
+    return all_data
+
+def add_exog_lags(df: pd.DataFrame,
+                  prefixes=("JP_", "DE_", "senpai_", "web_", "youtube_", "germany_"),
+                  lags=(1, 3, 6, 12)) -> pd.DataFrame:
+    """
+    指定prefixで始まる外生系列に対してラグ列を追加する。
+    例: JP_CPI -> JP_CPI_lag1, JP_CPI_lag3, ...
+    """
+    cols = [c for c in df.columns if c.startswith(prefixes)]
+    for c in cols:
+        for L in lags:
+            df[f"{c}_lag{L}"] = df[c].shift(L)
+    return df
+
+
+def train_test_split_by_date(data, train_start, train_end, test_start, test_end):
+    train = data[(data.index >= pd.to_datetime(train_start)) & (data.index <= pd.to_datetime(train_end))].copy()
+    test = data[(data.index >= pd.to_datetime(test_start)) & (data.index <= pd.to_datetime(test_end))].copy()
+
+    # ターゲットは非負に
+    train = clip_negative_values(train, include_prefixes=["Total_all_sales"])
+    test = clip_negative_values(test, include_prefixes=["Total_all_sales"])
+
+    print(f"\n【トレーニング・テスト分割】")
+    print(f"トレーニング期間: {train_start}～{train_end} → {len(train)}件")
+    print(f"テスト期間      : {test_start}～{test_end} → {len(test)}件")
+    return train, test
+
+
+def plot_2024_sales(test: pd.DataFrame, forecast: pd.Series) -> None:
+    plt.figure(figsize=(14, 6))
+    plt.plot(test.index, test["Total_all_sales"], "o-", label="2024年 実測値", alpha=0.7)
+    plt.plot(test.index, forecast, "g-", label="2024年 SARIMAX予測値", linewidth=2)
+    plt.title("トヨタ全車種販売台数（2024年のみ表示）", fontsize=14)
+    plt.xlabel("日付", fontsize=12)
+    plt.ylabel("販売台数", fontsize=12)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+
+def sarima_train_predict(train,test,params,exog_train=None,exog_test=None):
+    print("\n【SARIMAXモデルによる学習・予測】")
+    order = (params["p"], params["d"], params["q"])
+    seasonal_order = (params["P"], params["D"], params["Q"], params["s"])
+
+    if exog_train is None:
+        print(f"SARIMAパラメータ: SARIMA{order}x{seasonal_order}（外生変数なし）")
+    else:
+        print(f"SARIMAXパラメータ: SARIMA{order}x{seasonal_order} + exog（経済指標・外部要因・特徴量）")
+        print(f"exog次元: train={exog_train.shape}, test={exog_test.shape}")
+
+    model = SARIMAX(train["Total_all_sales"], order=order, seasonal_order=seasonal_order, exog=exog_train)
+    model_fit = model.fit(disp=False)
+
+    print("\n【SARIMA/SARIMAXモデル結果】")
+    summary_str = model_fit.summary().as_text()
+    try:
+        for line in summary_str.splitlines():
+            print(line)
+        # ファイルにも保存
+        with open("sarimax_results.txt", "w", encoding="utf-8") as f:
+            f.write(summary_str)
+        print("\n【SARIMAXモデル結果全文は sarimax_results.txt に保存しました】")
+    except Exception:
+        print(summary_str)
+
+    forecast = model_fit.forecast(steps=len(test), exog=exog_test)
+    forecast.index = test.index
+    forecast = forecast.clip(lower=0)  # 非負制約（販売台数は負にならない）
+
+    plot_2024_sales(test, forecast)
+
+    rmse = np.sqrt(mean_squared_error(test["Total_all_sales"], forecast))
+    mae = mean_absolute_error(test["Total_all_sales"], forecast)
+    valid = test["Total_all_sales"] != 0
+    mape = np.mean(np.abs((test["Total_all_sales"][valid] - forecast[valid]) / test["Total_all_sales"][valid])) * 100 if valid.sum() > 0 else np.nan
+    print("\n【テスト期間（2024年）予測評価】")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"MAE : {mae:.2f}")
+    print(f"MAPE: {mape:.2f}%")
+
+    pred_df = pd.DataFrame({"予測値": forecast, "実測値": test["Total_all_sales"]})
+    pred_df["月"] = pred_df.index.month
+
+    print("\n【2024年各月の予測販売台数と実測値】")
+    for month in range(1, 13):
+        rows = pred_df[pred_df["月"] == month]
+        if len(rows) == 0:
+            print(f"{month:>2}月: 予測値=データなし, 実測値=データなし")
+        else:
+            pred_mean = rows["予測値"].mean()
+            actual_mean = rows["実測値"].mean()
+            pred_str = f"{pred_mean:.1f}台" if pd.notnull(pred_mean) else "データなし"
+            actual_str = f"{actual_mean:.1f}台" if pd.notnull(actual_mean) else "データなし"
+            print(f"{month:>2}月: 予測値={pred_str:>12}, 実測値={actual_str}")
+
+    return model_fit, forecast, (rmse, mae, mape)
+
+
+def select_important_exog(data, target_col, exog_cols, top_n= 72):
+   
+    usable_cols = [c for c in exog_cols if c in data.columns and c != target_col]
+    if len(usable_cols) == 0:
+        print("\n【重要特徴選定】候補列がありません。")
+        return []
+
+    X = data[usable_cols].select_dtypes(include=[np.number])
+    y = data[target_col]
+
+    corr = X.apply(lambda col: col.corr(y)).abs()
+    corr = corr.dropna().sort_values(ascending=False)
+
+    if corr.empty:
+        print("\n【重要特徴選定】有効な相関が算出できませんでした。")
+        return []
+
+    selected = corr.head(min(top_n, len(corr))).index.tolist()
+    print(f"\n【選択された重要な経済指標・特徴量（上位{len(selected)}）】\n{selected}")
+    return selected
+
+
+def main() -> None:
+    print("Toyota 全車種 SARIMA/SARIMAX 需要予測分析を開始します...")
+
+    # 入力ファイル
+    toyota_file = "toyota_all_data.csv"
+    japan_file = "経済指標＿日本.csv"
+    germany_file = "経済指標＿ドイツ.csv"
+    senpai_file = "senpai_germany_result.csv"        # 追加外部要因（任意）
+    web_file = "toyota_all_web.csv"          # 追加外部要因（任意）
+    youtube_file = "toyota_all_youtube.csv"  # 追加外部要因（任意）
+    germanycar_file = 'ドイツ＿電動車全体.csv' # 追加外部要因（任意）
+
+    # 期間
+    train_start, train_end = "2020-01-01", "2023-12-31"
+    test_start, test_end = "2024-01-01", "2024-12-31"
+
+    # 1) トヨタ全体の販売データ
+    toyota_data = load_toyota_all_data(toyota_file, start_date_filter="2020-01-01")
+    if toyota_data is None or len(toyota_data) < 5:
+        print("十分なデータがありません。")
+        return
+
+    # 2) 経済指標・外部要因
+    toyota_data = preprocess_all_data(toyota_data, train_start, train_end)
+    toyota_data = add_features(toyota_data)
+    # EV関連・特徴量の負値最終クリップ
+    toyota_data = clip_negative_values(toyota_data, include_prefixes=['Total_all_sales', 'lag_', 'rolling_mean_'])
+
+    japan_econ = load_economic_indicator(japan_file, "JP", encoding="shift_jis")
+    germany_econ = load_economic_indicator(germany_file, "DE", encoding="shift_jis")
+    senpai = load_external_factor(senpai_file, prefix="senpai", encoding="shift_jis")
+    web = load_external_factor(web_file, prefix="web", encoding="shift_jis")
+    youtube = load_external_factor(youtube_file, prefix="youtube", encoding="shift_jis")
+    germany = load_external_factor(germanycar_file, prefix="germany", encoding="shift_jis")
+    
+
+    # 3) 結合（ターゲット＋経済指標＋外部要因）
+    all_data = toyota_data.join(japan_econ, how='left').join(germany_econ, how='left')
+    all_data = all_data.join(senpai, how='left')
+    all_data = all_data.join(web, how='left')
+    all_data = all_data.join(youtube, how='left')
+    all_data = all_data.join(germany, how='left')
+    all_data = all_data.sort_index()
+
+    # 4) 欠損補間（時系列補間→前方/後方埋め）
+    numeric_cols = all_data.select_dtypes(include=[np.number]).columns
+    all_data[numeric_cols] = all_data[numeric_cols].interpolate(method="time", limit_direction="both")
+    all_data = all_data.fillna(method="ffill").fillna(method="bfill")
+
+    # 4.5) 非負制約の再適用（販売・特徴・外部要因のみ）
+    all_data = clip_negative_values(all_data, include_prefixes=NONNEGATIVE_PREFIXES)
+
+    # 4.6) 経済指標・外部要因のラグ追加（1,3,6,12ヶ月）
+    all_data = add_exog_lags(all_data, lags=(1, 3, 6, 12))
+
+    # 5) 学習/評価データ分割
+    train, test = train_test_split_by_date(all_data, train_start, train_end, test_start, test_end)
+    # ---------------------------------------------------------
+    # 6) exog 候補の選定
+    # ---------------------------------------------------------
+    
+    # 経済指標：名前の中に "_lag" が含まれるものだけを取得（生変数を除外）
+    econ_cols = [c for c in all_data.columns if (c.startswith("JP_") or c.startswith("DE_")) and "_lag" in c]
+    
+    # 自己ラグ・移動平均：これらは最初から過去データなのでそのまま
+    lag_ma_cols = [c for c in all_data.columns if c.startswith("lag_") or c.startswith("rolling_mean_")]
+    
+    # 外部要因：名前の中に "_lag" が含まれるものだけを取得（生変数を除外）
+    external_cols = [c for c in all_data.columns if c.startswith(("senpai_", "web_", "youtube_", "germany_")) and "_lag" in c]
+    
+    # すべてを統合（これで、すべての変数が t-1 期以前のものになります）
+    exog_candidate_cols = econ_cols + lag_ma_cols + external_cols
+
+    print(f"\n【プランB適用】ラグなしの生変数を除外しました。")
+    print(f"候補列の例: {exog_candidate_cols[:5]}")
+    # ---------------------------------------------------------
+
+    # 重要度フィルター切り替え（どちらか一方だけコメント解除）
+    SELECT_IMPORTANT_EXOG = True   # 重要度フィルターを使う（相関上位を選定）
+    #SELECT_IMPORTANT_EXOG = False  # 重要度フィルターを使わない（候補の全外生を使用）
+
+    # 7) スイッチでフィルターON/OFF（情報リーク回避のため、選定は train 上で実施）
+    if SELECT_IMPORTANT_EXOG:
+        selected_exog = select_important_exog(train, "Total_all_sales", exog_candidate_cols, top_n=30)
+        exog_cols_to_use = selected_exog if len(selected_exog) > 0 else exog_candidate_cols
+        print(f"\n【外生変数】重要度フィルター有効: 使用列数={len(exog_cols_to_use)}")
+    else:
+        exog_cols_to_use = exog_candidate_cols
+        print(f"\n【外生変数】重要度フィルター無効: 使用列数={len(exog_cols_to_use)}")
+
+    # 8) exog_train / exog_test の作成（列を極力落とさない方針）
+    def build_exog(train_df: pd.DataFrame, test_df: pd.DataFrame, candidate_cols):
+        # 候補列の“和集合”を採用（どちらか一方にのみ存在でも採用）
+        cols_in_either = [c for c in candidate_cols if (c in train_df.columns) or (c in test_df.columns)]
+        if len(cols_in_either) == 0:
+            return None, None, []
+
+        tr = train_df.copy()
+        te = test_df.copy()
+        # 非数値は強制数値化（失敗は NaN）
+        for c in cols_in_either:
+            if c in tr.columns and not pd.api.types.is_numeric_dtype(tr[c]):
+                tr[c] = pd.to_numeric(tr[c], errors='coerce')
+            if c in te.columns and not pd.api.types.is_numeric_dtype(te[c]):
+                te[c] = pd.to_numeric(te[c], errors='coerce')
+
+        # 和集合でそろえる（無い側は NaN 列が追加される）
+        tr_exog = tr.reindex(columns=cols_in_either).astype(float)
+        te_exog = te.reindex(columns=cols_in_either).astype(float)
+        return tr_exog, te_exog, cols_in_either
+
+    def sanitize_exog(exog_tr: pd.DataFrame, exog_te: pd.DataFrame):
+        # None ガード
+        if exog_tr is None or exog_te is None:
+            return None, None, []
+        # inf -> NaN
+        tr = exog_tr.replace([np.inf, -np.inf], np.nan)
+        te = exog_te.replace([np.inf, -np.inf], np.nan)
+        # 可能なら時系列補間
+        try:
+            tr = tr.interpolate(method='time', limit_direction='both')
+            te = te.interpolate(method='time', limit_direction='both')
+        except Exception:
+            pass
+        # 学習側の列平均で埋める（平均が NaN=全欠損は 0）
+        means = tr.mean(axis=0).fillna(0.0)
+        tr = tr.fillna(means).fillna(0.0)
+        te = te.fillna(means).fillna(0.0)
+        # 列はドロップしない
+        return tr, te, list(tr.columns)
+
+    # ここで必ず初期化しておく（NameError回避）
+    exog_train, exog_test, used_cols = None, None, []
+
+    # 数値列で exog を構築（列は落とさない）
+    exog_train_raw, exog_test_raw, used_cols_raw = build_exog(train, test, exog_cols_to_use)
+    exog_train, exog_test, used_cols = sanitize_exog(exog_train_raw, exog_test_raw)
+
+    if exog_train is None:
+        print("\n【注意】外生変数が構築できませんでした。SARIMA（外生なし）で学習します。")
+    else:
+        print(f"\n【外生変数】最終使用列数: {len(used_cols)} 列")
+        if len(used_cols) > 0:
+            print("例:", used_cols[:min(10, len(used_cols))])
+
+    # 9) 学習・予測（外生あり/なしは exog_* の有無で自動）
+    sarima_model, sarima_forecast, sarima_metrics = sarima_train_predict(
+        train=train,
+        test=test,
+        params=PARAMS,
+        exog_train=exog_train,
+        exog_test=exog_test,
+    )
+
+    # 10) サマリー
+    print("\n【トヨタ全車種販売データ分析サマリー】")
+    print(f"トレーニング期間           : {train_start}～{train_end} ({len(train)}件)")
+    print(f"テスト期間                 : {test_start}～{test_end} ({len(test)}件)")
+    print(
+        f"SARIMA/SARIMAXテスト評価   : RMSE={sarima_metrics[0]:.2f}, MAE={sarima_metrics[1]:.2f}, MAPE={sarima_metrics[2]:.2f}%"
+    )
+    print("\n分析が完了しました。")
+
+
+if __name__ == "__main__":
+    main()
